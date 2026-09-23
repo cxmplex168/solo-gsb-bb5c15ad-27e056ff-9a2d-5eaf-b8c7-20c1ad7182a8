@@ -2,30 +2,47 @@
 
 基于 **React + TypeScript + Web Audio API** 的网页播客章节标注工具：导入本地音频后，在可缩放波形上拖拽创建、移动、调整章节区间，自动吸附邻近边界并阻止重叠，支持键盘微调、章节搜索/排序、选中片段实时预览，并导出带章节标题的 **WebVTT** 和 **JSON** 文件；也支持从本地 **JSON / WebVTT 章节文件导入**：解析后按当前音频时长逐条校验，在预览对话框中标出新增、时间越界、与现有章节重叠等状态，可只应用勾选的有效条目，整次导入为一个可撤销步骤。所有章节编辑（创建、移动、缩放、重命名、删除、「应用全部候选」以及章节文件导入）均记录为**可撤销 / 重做**的可逆操作，工具条按钮与 `Ctrl/Cmd+Z`、`Ctrl/Cmd+Shift+Z` 快捷键均可使用，撤销 / 重做不影响当前播放状态。内置**静音切分建议**：按 100ms 窗口分析多声道 RMS，自动在静音中点给出候选切分边界，可一键应用。另内置**章节音量一致性质检**：按 200ms 窗口计算多声道合并 dBFS，以窗口与章节的实际重叠时长加权汇总每章平均音量与动态范围，可自定义过轻 / 过响阈值，异常区间在波形上着色、点击即可从该处预览，并随 JSON 一并导出。支持**章节淡入淡出试听**：每章可独立设置 0～5 秒的淡入 / 淡出时长与开关，预览时按实际播放区间构建增益包络，淡入从静音平滑升至原音量、淡出在章尾前降至静音。另有**连锁移动模式**：锁定任意章节后，拖动 / 缩放未锁定章节会把边界位移原样传递给其后的未锁定章节（间隔与各章时长不变），遇到锁定章节或音频边界自动钳制并提示原因，一次拖拽连带变更整体可撤销 / 重做；锁定状态仅保留在当前会话，不影响导出格式。
 
-## 一键启动（Docker）
+## 一键启动（Docker Compose）
+
+前置条件：已安装 Docker 与 Docker Compose 插件（Docker Desktop / Docker Engine + compose plugin）。
+
+前台启动（日志直接输出到终端，`Ctrl+C` 停止）：
 
 ```bash
 docker compose up --build
 ```
 
-启动后访问：**http://localhost:8080**（宿主机端口 `8080` → 容器内 nginx `80`）。
+或后台守护启动：
 
-宿主机端口可通过环境变量覆盖，例如改用 9090：
+```bash
+docker compose up --build -d
+docker compose logs -f      # 查看日志
+docker compose down         # 停止并移除容器
+```
+
+启动后在浏览器访问：**http://localhost:8080**（默认宿主机端口 `8080` → 容器内 nginx 监听 `80`）。
+
+宿主机端口可通过环境变量 `PORT` 覆盖，例如改用 `9090`（访问 http://localhost:9090）：
 
 ```bash
 PORT=9090 docker compose up --build
 ```
 
-> 不使用 Compose 也可以：`docker build -t chapter-studio . && docker run -p 8080:80 chapter-studio`
+> 不使用 Compose 也可以：`docker build -t chapter-studio . && docker run -p 8080:80 chapter-studio`，然后访问 http://localhost:8080 。
+>
+> 容器内 nginx 始终监听 **80** 端口，请勿修改映射右侧的容器端口；只调整左侧宿主机端口（`PORT` 或 `-p 宿主端口:80`）。
 
 ## 本地开发
 
 ```bash
 npm install
-npm run dev        # http://localhost:5173
+npm run dev        # Vite 开发服务器，访问 http://localhost:5173 （已对局域网监听 0.0.0.0）
 npm test           # 章节吸附/防重叠 + 连锁移动 + 撤销/重做历史 + 静音切分 + 音量质检 + 淡入淡出包络 + 章节文件导入核心逻辑测试
-npm run build      # 产出 dist/
+npm run build      # 产出 dist/（峰值计算代码会被打成独立的 Worker chunk）
 ```
+
+> 波形峰值计算运行在独立 Web Worker 中；开发与生产构建均由 Vite 直接托管 Worker 产物，无需额外配置。
+
 
 ## 功能与操作
 
@@ -103,7 +120,7 @@ npm run build      # 产出 dist/
 
 ## 技术要点
 
-- 波形为自绘 Canvas：解码后预计算 200 peaks/s 的 min/max 峰值，任意缩放级别下按像素列聚合渲染，长音频也流畅。
+- 波形为自绘 Canvas：解码后预计算 200 peaks/s 的 min/max 峰值，任意缩放级别下按像素列聚合渲染，长音频也流畅。**峰值计算运行在独立 Web Worker（`src/audio/peaks.worker.ts`）中**：主线程仅向 Worker **复制**所需声道数据（至多前两个声道的 `Float32Array` 切片，以 transfer 方式移交副本），**不传递、也不转移原 `AudioBuffer`**——解码后的原始 PCM 始终保留在主线程供播放引擎与静音/音量质检使用；计算结果（min/max 两个数组）由 Worker transfer 回来，避免再拷贝。连续切换音频时按单调递增的载入 token 判定：旧解码 / 旧 Worker 任务在每个 `await` 后作废，旧 Worker 直接 `terminate()`（立刻停止 CPU 扫描）并以 `PeaksSupersededError` 拒绝，**只有最新一次载入能更新波形**；Worker 不支持的环境自动退回主线程纯函数；计算失败时已解码 buffer 不丢弃，页面显示可恢复提示并支持「重试计算波形 / 重新选择音频」（`src/audio/peaks.ts` 核心为纯函数 `computePeaksFromPCM`，Worker 与主线程兜底共用同一实现）。
 - 静音分析复用已解码的 `AudioBuffer`（不重新解码）：100ms 窗口多声道合并 RMS 只在导入时计算一次；阈值 / 最短静音变化时仅重算静音段与候选边界（`src/audio/silence.ts` 纯函数，由 `scripts/test-silence.ts` 覆盖）。
 - 音量质检同样复用导入时已解码的 PCM：200ms 窗口的多声道合并 dBFS 只在导入时计算一次；阈值变化仅对缓存数组重新分类与合并异常区间。章节均值采用能量（重叠时长）加权平均 `10·log10(Σwᵢ10^(dbᵢ/10)/Σwᵢ)`，跨章节窗口按实际重叠拆分归属；静音映射为 `-Infinity`（绝不出 NaN），全静音 / 极短章节均有确定结果（`src/audio/loudness.ts` 纯函数，由 `scripts/test-loudness.ts` 覆盖）。
 - 吸附 / 防重叠逻辑集中在 `src/utils/chapterOps.ts` 纯函数中（`moveChapter` / `resizeChapter` / `createChapterInGap` / `findFreeGap`），由 `scripts/test-chapterOps.ts` 覆盖。
@@ -121,7 +138,7 @@ npm run build      # 产出 dist/
 ├── docker-compose.yml      # 单服务，8080:80
 ├── nginx.conf              # SPA 回退 + 静态资源缓存
 ├── src/
-│   ├── audio/              # AudioEngine（播放/片段预览/淡入淡出包络）、fade（包络曲线）、peaks（波形峰值）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
+│   ├── audio/              # AudioEngine（播放/片段预览/淡入淡出包络）、fade（包络曲线）、peaks（波形峰值纯函数 + 主线程兜底）、peaks.worker（峰值计算 Web Worker）、PeaksWorkerClient（Worker 客户端：只传声道副本、旧任务作废、失败可重试）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
 │   ├── components/         # Waveform（锁定标识/连锁随动高亮/止点墙） / ChapterList（锁定按钮）/ ChainBar（连锁开关+实时摘要） / ImportDialog（JSON/WebVTT 导入预览）/ TransportBar / SilencePanel / LoudnessPanel / FadePanel
 │   ├── hooks/useChapters.ts  # 章节增删改 + 撤销/重做历史 + 会话级锁定/连锁开关（reset 随导入清空）+ replaceAll 整表事务
 │   ├── utils/chapterOps.ts # 吸附、防重叠、空档查找（纯函数）

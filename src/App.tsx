@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AudioEngine } from './audio/AudioEngine';
+import { AudioEngine, StaleDecodeError } from './audio/AudioEngine';
 import { DEFAULT_FADE, type FadeSettings } from './audio/fade';
 import {
   LOUDNESS_WINDOW_SEC,
@@ -8,7 +8,7 @@ import {
   findLoudnessSegments,
   type LoudnessThresholds,
 } from './audio/loudness';
-import { computePeaks } from './audio/peaks';
+import { PeaksSupersededError, PeaksWorkerClient } from './audio/PeaksWorkerClient';
 import {
   RMS_WINDOW_SEC,
   computeRmsWindows,
@@ -49,6 +49,11 @@ export default function App() {
   if (!engineRef.current) engineRef.current = new AudioEngine();
   const engine = engineRef.current;
 
+  // 波形峰值在独立 Web Worker 中计算，长音频不阻塞界面；Worker 随 App 单例
+  const peaksClientRef = useRef<PeaksWorkerClient | null>(null);
+  if (!peaksClientRef.current) peaksClientRef.current = new PeaksWorkerClient();
+  const peaksClient = peaksClientRef.current;
+
   const [fileName, setFileName] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
   const [duration, setDuration] = useState(0);
@@ -56,8 +61,14 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [pxPerSec, setPxPerSec] = useState(50);
   const [follow, setFollow] = useState(true);
-  const [decoding, setDecoding] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // 载入阶段：解码 / Worker 计算峰值；峰值失败可重试（原 buffer 仍保留）
+  const [loadPhase, setLoadPhase] = useState<'idle' | 'decoding' | 'peaks'>('idle');
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+  const [peaksError, setPeaksError] = useState<string | null>(null);
+  /** 当前已解码、且峰值阶段正在使用的 AudioBuffer（保留供播放 / 质检 / 重试） */
+  const currentBufferRef = useRef<AudioBuffer | null>(null);
+  /** 当前载入任务 token；连续切换时只有最新任务可写波形 */
+  const loadTokenRef = useRef(0);
 
   // silence-split suggestions
   const [rmsWindows, setRmsWindows] = useState<Float32Array | null>(null);
@@ -219,33 +230,80 @@ export default function App() {
     return () => cancelAnimationFrame(raf);
   }, [engine]);
 
-  useEffect(() => () => engine.dispose(), [engine]);
+  useEffect(
+    () => () => {
+      engine.dispose();
+      peaksClient.dispose();
+    },
+    [engine, peaksClient],
+  );
 
+  /**
+   * 运行 Worker 峰值任务。失败时不丢弃已解码 buffer，界面给出可恢复提示，
+   * 用户可点「重试」直接用缓存 buffer 重新计算。
+   */
+  const runPeaks = useCallback(
+    async (buffer: AudioBuffer, token: number) => {
+      setLoadPhase('peaks');
+      setPeaksError(null);
+      try {
+        const result = await peaksClient.compute(buffer);
+        if (token !== loadTokenRef.current) return; // 又切了文件：旧结果作废
+        setPeaks(result);
+        setLoadPhase('idle');
+      } catch (err) {
+        if (err instanceof PeaksSupersededError) return;
+        if (token !== loadTokenRef.current) return;
+        setPeaks(null);
+        setPeaksError('波形计算失败（可能是内存不足或 Worker 异常），可点「重试」重新计算。');
+        setLoadPhase('idle');
+      }
+    },
+    [peaksClient],
+  );
+
+  /**
+   * 载入新音频。连续切换时 token 单调递增：过期任务（旧解码 / 旧 Worker
+   * 峰值）在每个 await 后都被识别并静默丢弃，只有最新任务能写波形与元数据。
+   * 原 AudioBuffer 保留在 engine/currentBufferRef 中供播放、质检与峰值重试。
+   */
   const loadFile = useCallback(
     async (file: File) => {
-      setError(null);
-      setDecoding(true);
+      const token = ++loadTokenRef.current;
+      setDecodeError(null);
+      setPeaksError(null);
+      setLoadPhase('decoding');
       try {
         const buffer = await engine.decode(file);
+        if (token !== loadTokenRef.current) return; // 已被更新的选择取代
         resetChapters();
         previewRef.current = null;
-        setPeaks(computePeaks(buffer));
-        // reuse the decoded buffer for silence analysis (no re-decode)
+        currentBufferRef.current = buffer;
+        // 复用同一份解码 PCM 做静音与音量质检（不重新解码）
         setRmsWindows(computeRmsWindows(buffer));
-        // reuse the same decoded PCM once more for 200ms loudness windows
         setDbfsWindows(computeDbfsWindows(buffer));
         setDuration(buffer.duration);
         setFileName(file.name);
         setPlayhead(0);
         setPlaying(false);
-      } catch {
-        setError('无法解码该音频文件，请换用常见格式（MP3 / WAV / M4A / OGG）。');
-      } finally {
-        setDecoding(false);
+        await runPeaks(buffer, token);
+      } catch (err) {
+        if (token !== loadTokenRef.current) return;
+        if (err instanceof StaleDecodeError) return;
+        setDecodeError('无法解码该音频文件，请换用常见格式（MP3 / WAV / M4A / OGG）。');
+        setLoadPhase('idle');
       }
     },
-    [engine, resetChapters],
+    [engine, resetChapters, runPeaks],
   );
+
+  /** 峰值计算失败后的恢复入口：复用保留的 AudioBuffer，不再重新解码。 */
+  const retryPeaks = useCallback(() => {
+    const buffer = currentBufferRef.current;
+    if (!buffer || loadPhase !== 'idle') return;
+    const token = ++loadTokenRef.current;
+    void runPeaks(buffer, token);
+  }, [loadPhase, runPeaks]);
 
   const onFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -539,12 +597,29 @@ export default function App() {
         </button>
       </header>
 
-      {error && <div className="error-banner">{error}</div>}
+      {decodeError && <div className="error-banner">{decodeError}</div>}
       {notice && <div className="chain-notice">{notice}</div>}
 
       {!peaks ? (
         <div className="drop-zone">
-          {decoding ? '正在解码音频…' : '点击「导入音频」或将音频文件拖入页面'}
+          {loadPhase === 'decoding' ? (
+            '正在解码音频…'
+          ) : loadPhase === 'peaks' ? (
+            '正在后台线程计算波形峰值，长音频请稍候…'
+          ) : peaksError ? (
+            <div className="drop-error">
+              <span>{peaksError}</span>
+              <span className="drop-error-actions">
+                <button onClick={retryPeaks}>重试计算波形</button>
+                <label className="file-button">
+                  重新选择音频
+                  <input type="file" accept="audio/*" onChange={onFileInput} hidden />
+                </label>
+              </span>
+            </div>
+          ) : (
+            '点击「导入音频」或将音频文件拖入页面'
+          )}
         </div>
       ) : (
         <>

@@ -1,5 +1,13 @@
 import { buildFadeCurve, type FadeSpec } from './fade';
 
+/** Thrown when a decode() call is superseded by a newer file selection. */
+export class StaleDecodeError extends Error {
+  constructor() {
+    super('该音频的解码已被后续选择取代。');
+    this.name = 'StaleDecodeError';
+  }
+}
+
 /**
  * Thin wrapper around Web Audio API for buffer playback.
  * Supports full-file playback and segment (chapter) preview, optionally
@@ -8,6 +16,8 @@ import { buildFadeCurve, type FadeSpec } from './fade';
 export class AudioEngine {
   private ctx: AudioContext | null = null;
   private buffer: AudioBuffer | null = null;
+  /** increments per decode(); only the newest decode may publish a buffer */
+  private decodeSeq = 0;
   private source: AudioBufferSourceNode | null = null;
   private gain: GainNode | null = null;
   /** per-preview fade envelope node (source -> env -> gain) */
@@ -35,9 +45,15 @@ export class AudioEngine {
 
   async decode(file: File): Promise<AudioBuffer> {
     const ctx = this.ensureCtx();
+    const seq = ++this.decodeSeq;
     const data = await file.arrayBuffer();
+    // Another file was selected while this one was still decoding.
+    if (seq !== this.decodeSeq) throw new StaleDecodeError();
+    const decoded = await ctx.decodeAudioData(data);
+    // Decoding itself is async too — never let an older decode publish.
+    if (seq !== this.decodeSeq) throw new StaleDecodeError();
     this.stop();
-    this.buffer = await ctx.decodeAudioData(data);
+    this.buffer = decoded;
     return this.buffer;
   }
 

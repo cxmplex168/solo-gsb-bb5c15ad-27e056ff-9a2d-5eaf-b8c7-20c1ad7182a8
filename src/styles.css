@@ -124,6 +124,34 @@ button.danger:hover:not(:disabled) {
   border-radius: 12px;
 }
 
+.drop-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  color: #ffd7d5;
+}
+
+.drop-error-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.drop-error-actions button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.drop-error-actions button:hover {
+  background: rgba(94, 177, 255, 0.12);
+}
+
 .transport {
   display: flex;
   align-items: center;
