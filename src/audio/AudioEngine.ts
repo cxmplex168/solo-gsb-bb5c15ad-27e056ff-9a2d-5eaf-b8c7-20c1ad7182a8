@@ -18,6 +18,8 @@ export class AudioEngine {
   private offset = 0;
   private stopAt: number | null = null;
   private stopTimer: number | null = null;
+  /** increments on every decode() so a slower older decode can never replace a newer buffer */
+  private decodeSeq = 0;
   playing = false;
   onEnded: (() => void) | null = null;
 
@@ -36,8 +38,15 @@ export class AudioEngine {
   async decode(file: File): Promise<AudioBuffer> {
     const ctx = this.ensureCtx();
     const data = await file.arrayBuffer();
+    const seq = ++this.decodeSeq;
     this.stop();
-    this.buffer = await ctx.decodeAudioData(data);
+    const decoded = await ctx.decodeAudioData(data);
+    // A newer file may have been selected while this one was still decoding;
+    // only the latest decode may install / return its buffer.
+    if (seq !== this.decodeSeq) {
+      throw Object.assign(new Error('已被新的音频载入任务取代。'), { name: 'AbortError' });
+    }
+    this.buffer = decoded;
     return this.buffer;
   }
 
@@ -47,6 +56,15 @@ export class AudioEngine {
 
   get hasBuffer(): boolean {
     return this.buffer !== null;
+  }
+
+  /**
+   * The currently decoded buffer. Kept after loading (and after a failed
+   * waveform computation) so playback, silence/loudness QC and waveform
+   * retries all reuse the same decoded PCM.
+   */
+  getBuffer(): AudioBuffer | null {
+    return this.buffer;
   }
 
   /** Current playback position in seconds (buffer timeline). */

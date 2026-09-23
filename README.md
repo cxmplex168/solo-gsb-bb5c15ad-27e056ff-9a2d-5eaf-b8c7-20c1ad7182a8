@@ -4,27 +4,40 @@
 
 ## 一键启动（Docker）
 
+前置条件：本机已安装 Docker（含 Compose 插件）。无需在宿主机安装 Node.js。
+
 ```bash
 docker compose up --build
 ```
 
-启动后访问：**http://localhost:8080**（宿主机端口 `8080` → 容器内 nginx `80`）。
+首次构建会执行 `npm ci && npm run build`（波形计算 Worker 会被打成独立 chunk），完成后启动单容器 nginx。启动成功后在浏览器访问：
 
-宿主机端口可通过环境变量覆盖，例如改用 9090：
+- **http://localhost:8080**（宿主机端口 `8080` → 容器内 nginx `80`）
+
+修改端口（例如改用 9090）：
 
 ```bash
-PORT=9090 docker compose up --build
+PORT=9090 docker compose up --build        # 访问 http://localhost:9090
+# 或固定写入：在项目根目录创建 .env，内容为 PORT=9090
 ```
 
-> 不使用 Compose 也可以：`docker build -t chapter-studio . && docker run -p 8080:80 chapter-studio`
+后台运行 / 停止：
+
+```bash
+docker compose up --build -d               # 后台启动
+docker compose down                        # 停止并移除容器
+docker compose logs -f                     # 查看日志
+```
+
+> 不使用 Compose 也可以：`docker build -t chapter-studio . && docker run -p 8080:80 chapter-studio`（同样访问 http://localhost:8080）
 
 ## 本地开发
 
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 章节吸附/防重叠 + 连锁移动 + 撤销/重做历史 + 静音切分 + 音量质检 + 淡入淡出包络 + 章节文件导入核心逻辑测试
-npm run build      # 产出 dist/
+npm test           # 章节吸附/防重叠 + 连锁移动 + 撤销/重做历史 + 静音切分 + 音量质检 + 淡入淡出包络 + 章节文件导入 + 波形峰值核心逻辑测试
+npm run build      # 产出 dist/（含独立的 peaks.worker chunk），可用 npm run preview 预览
 ```
 
 ## 功能与操作
@@ -103,7 +116,7 @@ npm run build      # 产出 dist/
 
 ## 技术要点
 
-- 波形为自绘 Canvas：解码后预计算 200 peaks/s 的 min/max 峰值，任意缩放级别下按像素列聚合渲染，长音频也流畅。
+- 波形为自绘 Canvas：解码后预计算 200 peaks/s 的 min/max 峰值，任意缩放级别下按像素列聚合渲染，长音频也流畅。**峰值计算在独立 Web Worker 中进行**（`src/audio/peaks.worker.ts`，由 Vite 打成独立 chunk）：载入长音频时主线程只向 Worker 传递所需声道（最多前两个声道）的 `slice()` 副本，原 `AudioBuffer` 始终保留在主线程供播放、静音与音量质检复用，不随消息转移；Worker 算完后以 transferable 方式零拷贝回传 min/max `Float32Array`。连续切换音频时按载入令牌（token）+ Worker 端「仅最新任务」双重判定：新任务会终止旧 Worker（旧计算连同其中途结果一并丢弃），只有最新一次载入能更新波形；Worker 不可用或发送失败时自动回退到主线程同步计算；若 Worker 运行期失败，载入界面给出「重试生成波形」的**可恢复提示**，直接复用已解码缓冲重试、无需重新导入文件（`src/audio/PeaksWorkerClient.ts`，核心纯函数见 `src/audio/peaks.ts`，由 `scripts/test-peaks.ts` 覆盖）。
 - 静音分析复用已解码的 `AudioBuffer`（不重新解码）：100ms 窗口多声道合并 RMS 只在导入时计算一次；阈值 / 最短静音变化时仅重算静音段与候选边界（`src/audio/silence.ts` 纯函数，由 `scripts/test-silence.ts` 覆盖）。
 - 音量质检同样复用导入时已解码的 PCM：200ms 窗口的多声道合并 dBFS 只在导入时计算一次；阈值变化仅对缓存数组重新分类与合并异常区间。章节均值采用能量（重叠时长）加权平均 `10·log10(Σwᵢ10^(dbᵢ/10)/Σwᵢ)`，跨章节窗口按实际重叠拆分归属；静音映射为 `-Infinity`（绝不出 NaN），全静音 / 极短章节均有确定结果（`src/audio/loudness.ts` 纯函数，由 `scripts/test-loudness.ts` 覆盖）。
 - 吸附 / 防重叠逻辑集中在 `src/utils/chapterOps.ts` 纯函数中（`moveChapter` / `resizeChapter` / `createChapterInGap` / `findFreeGap`），由 `scripts/test-chapterOps.ts` 覆盖。
@@ -121,7 +134,7 @@ npm run build      # 产出 dist/
 ├── docker-compose.yml      # 单服务，8080:80
 ├── nginx.conf              # SPA 回退 + 静态资源缓存
 ├── src/
-│   ├── audio/              # AudioEngine（播放/片段预览/淡入淡出包络）、fade（包络曲线）、peaks（波形峰值）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
+│   ├── audio/              # AudioEngine（播放/片段预览/淡入淡出包络）、fade（包络曲线）、peaks（波形峰值纯函数 + Worker 消息类型）、peaks.worker（Worker 内峰值计算）、PeaksWorkerClient（仅最新任务/失败回退与重试）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
 │   ├── components/         # Waveform（锁定标识/连锁随动高亮/止点墙） / ChapterList（锁定按钮）/ ChainBar（连锁开关+实时摘要） / ImportDialog（JSON/WebVTT 导入预览）/ TransportBar / SilencePanel / LoudnessPanel / FadePanel
 │   ├── hooks/useChapters.ts  # 章节增删改 + 撤销/重做历史 + 会话级锁定/连锁开关（reset 随导入清空）+ replaceAll 整表事务
 │   ├── utils/chapterOps.ts # 吸附、防重叠、空档查找（纯函数）
@@ -130,5 +143,5 @@ npm run build      # 产出 dist/
 │   ├── utils/history.ts    # 撤销/重做快照栈、连续编辑合并、重做栈清空（纯函数）
 │   ├── utils/export.ts     # WebVTT / JSON（含章节质检指标）导出
 │   └── utils/importChapters.ts # WebVTT / JSON 解析、逐条校验预览、全有或全无合并（纯函数）
-└── scripts/                # test-chapterOps、test-chainOps、test-history、test-silence、test-loudness、test-fade、test-importChapters
+└── scripts/                # test-chapterOps、test-chainOps、test-history、test-silence、test-loudness、test-fade、test-importChapters、test-peaks
 ```

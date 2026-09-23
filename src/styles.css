@@ -124,6 +124,25 @@ button.danger:hover:not(:disabled) {
   border-radius: 12px;
 }
 
+.peaks-retry {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  padding: 24px;
+  color: #ffd7d5;
+}
+
+.peaks-retry .primary {
+  padding: 8px 18px;
+}
+
+.peaks-retry .muted-hint {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .transport {
   display: flex;
   align-items: center;

@@ -8,7 +8,7 @@ import {
   findLoudnessSegments,
   type LoudnessThresholds,
 } from './audio/loudness';
-import { computePeaks } from './audio/peaks';
+import { PeaksWorkerClient } from './audio/PeaksWorkerClient';
 import {
   RMS_WINDOW_SEC,
   computeRmsWindows,
@@ -49,6 +49,14 @@ export default function App() {
   if (!engineRef.current) engineRef.current = new AudioEngine();
   const engine = engineRef.current;
 
+  // Waveform peaks are computed in a dedicated Web Worker so a long file
+  // never blocks the UI; the decoded AudioBuffer stays in the engine for
+  // playback and the silence/loudness QC passes.
+  const peaksClientRef = useRef<PeaksWorkerClient | null>(null);
+  if (!peaksClientRef.current) peaksClientRef.current = new PeaksWorkerClient();
+  // only the latest load attempt may publish waveform/QC state
+  const loadTokenRef = useRef(0);
+
   const [fileName, setFileName] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
   const [duration, setDuration] = useState(0);
@@ -57,6 +65,10 @@ export default function App() {
   const [pxPerSec, setPxPerSec] = useState(50);
   const [follow, setFollow] = useState(true);
   const [decoding, setDecoding] = useState(false);
+  /** peaks worker stage, after decoding has finished */
+  const [peaksPending, setPeaksPending] = useState(false);
+  /** recoverable waveform failure (audio itself is loaded — retry is possible) */
+  const [peaksError, setPeaksError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // silence-split suggestions
@@ -221,15 +233,46 @@ export default function App() {
 
   useEffect(() => () => engine.dispose(), [engine]);
 
+  // tear down the peaks worker with the app
+  useEffect(() => () => peaksClientRef.current?.dispose(), []);
+
+  /**
+   * Run the off-thread waveform peaks job for one decoded buffer.
+   * Only the latest load (identified by `token`) may publish peaks; a
+   * superseded/failed-to-start run resolves to nothing.
+   */
+  const requestPeaks = useCallback(async (buffer: AudioBuffer, token: number) => {
+    try {
+      const nextPeaks = await peaksClientRef.current!.computePeaks(buffer);
+      if (token !== loadTokenRef.current) return; // a newer load superseded this one
+      setPeaks(nextPeaks);
+      setPeaksError(null);
+      setPeaksPending(false);
+    } catch (err) {
+      if (token !== loadTokenRef.current) return;
+      if (err instanceof Error && err.name === 'AbortError') return;
+      setPeaksPending(false);
+      // The audio is loaded and playable; only the waveform failed — offer
+      // a retry against the retained decoded buffer instead of re-importing.
+      setPeaksError('波形生成失败（可能因内存不足或计算 Worker 被中止）。音频已载入，可重试生成波形。');
+    }
+  }, []);
+
   const loadFile = useCallback(
     async (file: File) => {
+      const token = ++loadTokenRef.current;
+      peaksClientRef.current?.cancel();
       setError(null);
+      setPeaksError(null);
+      setPeaksPending(false);
       setDecoding(true);
       try {
         const buffer = await engine.decode(file);
+        if (token !== loadTokenRef.current) return; // superseded while decoding
         resetChapters();
         previewRef.current = null;
-        setPeaks(computePeaks(buffer));
+        // swap to the loading surface until the worker returns the peaks
+        setPeaks(null);
         // reuse the decoded buffer for silence analysis (no re-decode)
         setRmsWindows(computeRmsWindows(buffer));
         // reuse the same decoded PCM once more for 200ms loudness windows
@@ -238,14 +281,30 @@ export default function App() {
         setFileName(file.name);
         setPlayhead(0);
         setPlaying(false);
-      } catch {
-        setError('无法解码该音频文件，请换用常见格式（MP3 / WAV / M4A / OGG）。');
-      } finally {
         setDecoding(false);
+        setPeaksPending(true);
+        // waveform peaks are computed in the Web Worker (long files no
+        // longer block the UI); the buffer above stays in the engine
+        await requestPeaks(buffer, token);
+      } catch (err) {
+        if (token !== loadTokenRef.current) return;
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setDecoding(false);
+        setPeaksPending(false);
+        setError('无法解码该音频文件，请换用常见格式（MP3 / WAV / M4A / OGG）。');
       }
     },
-    [engine, resetChapters],
+    [engine, resetChapters, requestPeaks],
   );
+
+  /** Recover from a peaks-worker failure without re-importing the file. */
+  const retryPeaks = useCallback(() => {
+    const buffer = engine.getBuffer();
+    if (!buffer || peaksPending) return;
+    setPeaksError(null);
+    setPeaksPending(true);
+    void requestPeaks(buffer, loadTokenRef.current);
+  }, [engine, peaksPending, requestPeaks]);
 
   const onFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -544,7 +603,21 @@ export default function App() {
 
       {!peaks ? (
         <div className="drop-zone">
-          {decoding ? '正在解码音频…' : '点击「导入音频」或将音频文件拖入页面'}
+          {decoding ? (
+            '正在解码音频…'
+          ) : peaksError ? (
+            <div className="peaks-retry">
+              <span>{peaksError}</span>
+              <button className="primary" onClick={retryPeaks}>
+                重试生成波形
+              </button>
+              <span className="muted-hint">也可以重新拖入或在上方重新选择音频文件。</span>
+            </div>
+          ) : peaksPending ? (
+            '正在后台计算波形峰值…'
+          ) : (
+            '点击「导入音频」或将音频文件拖入页面'
+          )}
         </div>
       ) : (
         <>
